@@ -1,458 +1,279 @@
-"""Workflow management API routes.
+"""Workflow management and execution routes."""
 
-Provides CRUD operations for workflows, workflow validation (DAG cycle
-detection), execution queuing, and run history retrieval.
-"""
+from __future__ import annotations
 
+import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException, Request
 
-from app.database import get_db
-from app.models import NodeExecution, Workflow, WorkflowRun
-from app.schemas import (
-    WorkflowCreate,
-    WorkflowListResponse,
-    WorkflowResponse,
-    WorkflowRunRequest,
-    WorkflowRunResponse,
-    WorkflowRunsListResponse,
-    WorkflowUpdate,
-    WorkflowValidationResult,
-)
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["workflows"])
 
-router = APIRouter(prefix="/api/v1", tags=["workflows"])
+# In-memory store (replace with PostgreSQL in production)
+_workflows: dict[str, dict] = {}
+_runs: dict[str, dict] = {}
 
 
-@router.get(
-    "/workflows",
-    response_model=WorkflowListResponse,
-    summary="List workflows",
-    description="Retrieve a paginated list of workflows with optional filtering.",
-)
-async def list_workflows(
-    status: Optional[str] = Query(None, description="Filter by workflow status"),
-    is_template: Optional[bool] = Query(None, description="Filter by template flag"),
-    search: Optional[str] = Query(None, description="Search in name and description"),
-    skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(50, ge=1, le=100, description="Maximum records to return"),
-    db: AsyncSession = Depends(get_db),
-) -> WorkflowListResponse:
-    """List workflows with optional filtering and pagination.
+# ─── CRUD ──────────────────────────────────────────────────
 
-    Args:
-        status: Filter by workflow status.
-        is_template: Filter by template flag.
-        search: Free-text search across name and description.
-        skip: Pagination offset.
-        limit: Pagination page size.
-        db: Database session.
-
-    Returns:
-        Paginated list of workflows with total count.
-    """
-    query = select(Workflow).where(Workflow.is_deleted.is_(False))
-
+@router.get("/workflows")
+async def list_workflows(status: str | None = None, search: str | None = None) -> dict:
+    items = list(_workflows.values())
     if status:
-        query = query.where(Workflow.status == status)
-    if is_template is not None:
-        query = query.where(Workflow.is_template == is_template)
+        items = [w for w in items if w.get("status") == status]
     if search:
-        query = query.where(
-            Workflow.name.ilike(f"%{search}%")
-            | Workflow.description.ilike(f"%{search}%")
-        )
-
-    count_query = select(func.count()).select_from(query.subquery())
-    total_result = await db.execute(count_query)
-    total = total_result.scalar_one()
-
-    query = query.order_by(Workflow.created_at.desc()).offset(skip).limit(limit)
-    result = await db.execute(query)
-    items = result.scalars().all()
-
-    return WorkflowListResponse(
-        items=list(items),
-        total=total,
-        skip=skip,
-        limit=limit,
-    )
+        items = [w for w in items if search.lower() in w.get("name", "").lower()]
+    return {"items": items, "total": len(items), "skip": 0, "limit": 50}
 
 
-@router.post(
-    "/workflows",
-    response_model=WorkflowResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create workflow",
-    description="Create a new workflow definition.",
-)
-async def create_workflow(
-    data: WorkflowCreate,
-    db: AsyncSession = Depends(get_db),
-) -> Workflow:
-    """Create a new workflow.
-
-    Args:
-        data: Workflow creation payload.
-        db: Database session.
-
-    Returns:
-        The newly created workflow.
-
-    Raises:
-        HTTPException: 400 if workflow name already exists.
-    """
-    existing = await db.execute(
-        select(Workflow).where(
-            Workflow.name == data.name, Workflow.is_deleted.is_(False)
-        )
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Workflow with name '{data.name}' already exists",
-        )
-
-    workflow = Workflow(**data.model_dump())
-    db.add(workflow)
-    await db.commit()
-    await db.refresh(workflow)
+@router.post("/workflows")
+async def create_workflow(body: dict) -> dict:
+    wf_id = str(uuid.uuid4())
+    workflow = {
+        "id": wf_id,
+        "name": body.get("name", "Untitled"),
+        "slug": body.get("slug", f"workflow-{wf_id[:8]}"),
+        "description": body.get("description", ""),
+        "version": body.get("version", "1.0.0"),
+        "definition": body.get("definition", {"nodes": [], "edges": []}),
+        "status": body.get("status", "draft"),
+        "is_template": body.get("is_template", False),
+        "created_at": _now(),
+        "updated_at": _now(),
+    }
+    _workflows[wf_id] = workflow
     return workflow
 
 
-@router.get(
-    "/workflows/{id}",
-    response_model=WorkflowResponse,
-    summary="Get workflow",
-    description="Retrieve a single workflow by its ID.",
-)
-async def get_workflow(
-    id: str,
-    db: AsyncSession = Depends(get_db),
-) -> Workflow:
-    """Get a workflow by ID.
+@router.get("/workflows/{wf_id}")
+async def get_workflow(wf_id: str) -> dict:
+    if wf_id not in _workflows:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return _workflows[wf_id]
 
-    Args:
-        id: The workflow's unique identifier.
-        db: Database session.
 
-    Returns:
-        The requested workflow.
+@router.put("/workflows/{wf_id}")
+async def update_workflow(wf_id: str, body: dict) -> dict:
+    if wf_id not in _workflows:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    _workflows[wf_id].update({k: v for k, v in body.items() if v is not None})
+    _workflows[wf_id]["updated_at"] = _now()
+    return _workflows[wf_id]
 
-    Raises:
-        HTTPException: 404 if workflow not found.
+
+@router.delete("/workflows/{wf_id}")
+async def delete_workflow(wf_id: str) -> dict:
+    if wf_id not in _workflows:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    del _workflows[wf_id]
+    return {"status": "deleted"}
+
+
+# ─── Validation ────────────────────────────────────────────
+
+@router.post("/workflows/{wf_id}/validate")
+async def validate_workflow(wf_id: str, request: Request) -> dict:
+    if wf_id not in _workflows:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    from app.services.workflow_engine import WorkflowEngine
+    engine = request.app.state.workflow_engine
+    definition = _workflows[wf_id]["definition"]
+
+    is_valid, errors = engine.validate_dag(definition)
+    return {
+        "valid": is_valid,
+        "errors": errors,
+        "node_count": len(definition.get("nodes", [])),
+        "edge_count": len(definition.get("edges", [])),
+    }
+
+
+# ─── Execution ─────────────────────────────────────────────
+
+@router.post("/workflows/{wf_id}/run")
+async def run_workflow(wf_id: str, body: dict | None = None, request: Request | None = None) -> dict:
+    """Start workflow execution as a background task.
+
+    Returns immediately with run_id. Poll GET /runs/{run_id} for status,
+    or connect to WebSocket for real-time updates.
     """
-    result = await db.execute(
-        select(Workflow).where(Workflow.id == id, Workflow.is_deleted.is_(False))
-    )
-    workflow = result.scalar_one_or_none()
-    if not workflow:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow '{id}' not found",
-        )
-    return workflow
+    if wf_id not in _workflows:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    workflow = _workflows[wf_id]
+    definition = workflow["definition"]
+    inputs = (body or {}).get("inputs", {})
+    run_id = str(uuid.uuid4())
+    thread_id = str(uuid.uuid4())
+
+    # Store run metadata
+    _runs[run_id] = {
+        "id": run_id,
+        "workflow_id": wf_id,
+        "thread_id": thread_id,
+        "status": "running",
+        "inputs": inputs,
+        "outputs": {},
+        "started_at": _now(),
+    }
+
+    # Start execution as background task
+    engine = request.app.state.workflow_engine if request else WorkflowEngine()
+
+    async def on_event(event: dict) -> None:
+        """Event callback to update run state."""
+        if event.get("run_id") == run_id:
+            if event["type"] == "node.completed":
+                if run_id in _runs:
+                    _runs[run_id].setdefault("node_outputs", {})[event["node_id"]] = event.get("output", "")
+            elif event["type"] in ("workflow.completed", "workflow.failed"):
+                if run_id in _runs:
+                    _runs[run_id]["status"] = "completed" if event["type"] == "workflow.completed" else "failed"
+                    _runs[run_id]["completed_at"] = _now()
+
+    engine.on_event(on_event)
+
+    # Fire and forget
+    engine.start_execution(definition, inputs, run_id, thread_id)
+
+    logger.info("Started workflow run %s for workflow %s", run_id, wf_id)
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "message": "Workflow started. Poll GET /api/v1/runs/{run_id} for status.",
+    }
 
 
-@router.put(
-    "/workflows/{id}",
-    response_model=WorkflowResponse,
-    summary="Update workflow",
-    description="Update an existing workflow definition.",
-)
-async def update_workflow(
-    id: str,
-    data: WorkflowUpdate,
-    db: AsyncSession = Depends(get_db),
-) -> Workflow:
-    """Update a workflow by ID.
-
-    Args:
-        id: The workflow's unique identifier.
-        data: Workflow update payload (partial).
-        db: Database session.
-
-    Returns:
-        The updated workflow.
-
-    Raises:
-        HTTPException: 404 if workflow not found.
-    """
-    result = await db.execute(
-        select(Workflow).where(Workflow.id == id, Workflow.is_deleted.is_(False))
-    )
-    workflow = result.scalar_one_or_none()
-    if not workflow:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow '{id}' not found",
-        )
-
-    update_data = data.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(workflow, field, value)
-
-    await db.commit()
-    await db.refresh(workflow)
-    return workflow
+@router.get("/workflows/{wf_id}/runs")
+async def get_workflow_runs(wf_id: str) -> dict:
+    items = [r for r in _runs.values() if r["workflow_id"] == wf_id]
+    return {"items": items, "total": len(items), "skip": 0, "limit": 50}
 
 
-@router.delete(
-    "/workflows/{id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete workflow",
-    description="Soft-delete a workflow.",
-)
-async def delete_workflow(
-    id: str,
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    """Soft-delete a workflow by ID.
+# ─── Run management ────────────────────────────────────────
 
-    Args:
-        id: The workflow's unique identifier.
-        db: Database session.
-
-    Raises:
-        HTTPException: 404 if workflow not found.
-    """
-    result = await db.execute(
-        select(Workflow).where(Workflow.id == id, Workflow.is_deleted.is_(False))
-    )
-    workflow = result.scalar_one_or_none()
-    if not workflow:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow '{id}' not found",
-        )
-
-    workflow.is_deleted = True
-    workflow.status = "deleted"
-    await db.commit()
+@router.get("/runs/{run_id}")
+async def get_run(run_id: str) -> dict:
+    if run_id not in _runs:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return _runs[run_id]
 
 
-@router.post(
-    "/workflows/{id}/run",
-    response_model=WorkflowRunResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Run workflow",
-    description="Queue a workflow for execution.",
-)
-async def run_workflow(
-    id: str,
-    request: WorkflowRunRequest,
-    db: AsyncSession = Depends(get_db),
-) -> WorkflowRunResponse:
-    """Queue a workflow for execution.
-
-    Creates a WorkflowRun record with status "pending" and returns
-    the run details. Actual execution is handled by the workflow engine.
-
-    Args:
-        id: The workflow's unique identifier.
-        request: Workflow run request with input data.
-        db: Database session.
-
-    Returns:
-        Workflow run details indicating the workflow has been queued.
-
-    Raises:
-        HTTPException: 404 if workflow not found.
-    """
-    result = await db.execute(
-        select(Workflow).where(Workflow.id == id, Workflow.is_deleted.is_(False))
-    )
-    workflow = result.scalar_one_or_none()
-    if not workflow:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow '{id}' not found",
-        )
-
-    run = WorkflowRun(
-        id=str(uuid.uuid4()),
-        workflow_id=id,
-        status="pending",
-        input_data=request.input_data or {},
-        trigger=request.trigger or "manual",
-    )
-    db.add(run)
-    await db.commit()
-    await db.refresh(run)
-
-    return WorkflowRunResponse(
-        run_id=run.id,
-        workflow_id=id,
-        status="pending",
-        message="Workflow queued for execution",
-    )
+@router.post("/runs/{run_id}/pause")
+async def pause_run(run_id: str, request: Request) -> dict:
+    if run_id not in _runs:
+        raise HTTPException(status_code=404, detail="Run not found")
+    engine = request.app.state.workflow_engine
+    await engine.pause_run(run_id)
+    _runs[run_id]["status"] = "paused"
+    return {"status": "paused"}
 
 
-@router.post(
-    "/workflows/{id}/validate",
-    response_model=WorkflowValidationResult,
-    summary="Validate workflow",
-    description="Validate workflow definition for DAG correctness (cycle detection).",
-)
-async def validate_workflow(
-    id: str,
-    db: AsyncSession = Depends(get_db),
-) -> WorkflowValidationResult:
-    """Validate a workflow definition.
-
-    Parses the workflow definition (nodes and edges) and checks for
-    cycles using depth-first search (DFS).
-
-    Args:
-        id: The workflow's unique identifier.
-        db: Database session.
-
-    Returns:
-        Validation result with valid flag and any error messages.
-
-    Raises:
-        HTTPException: 404 if workflow not found.
-    """
-    result = await db.execute(
-        select(Workflow).where(Workflow.id == id, Workflow.is_deleted.is_(False))
-    )
-    workflow = result.scalar_one_or_none()
-    if not workflow:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow '{id}' not found",
-        )
-
-    definition: Dict[str, Any] = workflow.definition or {}
-    nodes: List[Dict[str, Any]] = definition.get("nodes", [])
-    edges: List[Dict[str, Any]] = definition.get("edges", [])
-    errors: List[str] = []
-
-    # Validate nodes exist
-    if not nodes:
-        errors.append("Workflow has no nodes")
-        return WorkflowValidationResult(valid=False, errors=errors)
-
-    # Build adjacency list
-    node_ids = {n.get("id") for n in nodes if n.get("id")}
-    adjacency: Dict[str, List[str]] = {nid: [] for nid in node_ids}
-
-    for edge in edges:
-        source = edge.get("source")
-        target = edge.get("target")
-        if source in adjacency and target in adjacency:
-            adjacency[source].append(target)
-
-    # Check for references to non-existent nodes
-    for edge in edges:
-        if edge.get("source") not in node_ids:
-            errors.append(f"Edge references non-existent source node: {edge.get('source')}")
-        if edge.get("target") not in node_ids:
-            errors.append(f"Edge references non-existent target node: {edge.get('target')}")
-
-    # DFS cycle detection
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = {nid: WHITE for nid in node_ids}
-
-    def _dfs(node_id: str, path: List[str]) -> bool:
-        color[node_id] = GRAY
-        for neighbor in adjacency.get(node_id, []):
-            if color.get(neighbor) == GRAY:
-                cycle_nodes = path[path.index(neighbor):] + [neighbor]
-                errors.append(
-                    f"Cycle detected: {' -> '.join(cycle_nodes)}"
-                )
-                return True
-            if color.get(neighbor) == WHITE:
-                if _dfs(neighbor, path + [neighbor]):
-                    return True
-        color[node_id] = BLACK
-        return False
-
-    has_cycle = False
-    for nid in node_ids:
-        if color[nid] == WHITE:
-            if _dfs(nid, [nid]):
-                has_cycle = True
-
-    # Check for disconnected nodes
-    if edges:
-        connected = set()
-        for edge in edges:
-            connected.add(edge.get("source"))
-            connected.add(edge.get("target"))
-        disconnected = node_ids - connected
-        if disconnected:
-            errors.append(f"Disconnected nodes (no edges): {', '.join(disconnected)}")
-
-    valid = not has_cycle and len(errors) == 0
-
-    return WorkflowValidationResult(
-        valid=valid,
-        errors=errors,
-        node_count=len(nodes),
-        edge_count=len(edges),
-    )
+@router.post("/runs/{run_id}/resume")
+async def resume_run(run_id: str, request: Request) -> dict:
+    if run_id not in _runs:
+        raise HTTPException(status_code=404, detail="Run not found")
+    engine = request.app.state.workflow_engine
+    await engine.resume_run(run_id)
+    _runs[run_id]["status"] = "running"
+    return {"status": "running"}
 
 
-@router.get(
-    "/workflows/{id}/runs",
-    response_model=WorkflowRunsListResponse,
-    summary="Get workflow runs",
-    description="Retrieve execution history for a specific workflow.",
-)
-async def get_workflow_runs(
-    id: str,
-    status: Optional[str] = Query(None, description="Filter by run status"),
-    skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(50, ge=1, le=100, description="Maximum records to return"),
-    db: AsyncSession = Depends(get_db),
-) -> WorkflowRunsListResponse:
-    """Get all runs for a specific workflow.
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str, request: Request) -> dict:
+    if run_id not in _runs:
+        raise HTTPException(status_code=404, detail="Run not found")
+    engine = request.app.state.workflow_engine
+    await engine.cancel_run(run_id)
+    _runs[run_id]["status"] = "cancelled"
+    return {"status": "cancelled"}
 
-    Args:
-        id: The workflow's unique identifier.
-        status: Filter by run status.
-        skip: Pagination offset.
-        limit: Pagination page size.
-        db: Database session.
 
-    Returns:
-        Paginated list of workflow runs.
+# ─── Helpers ───────────────────────────────────────────────
 
-    Raises:
-        HTTPException: 404 if workflow not found.
-    """
-    workflow_result = await db.execute(
-        select(Workflow).where(Workflow.id == id, Workflow.is_deleted.is_(False))
-    )
-    if not workflow_result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow '{id}' not found",
-        )
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
-    query = select(WorkflowRun).where(WorkflowRun.workflow_id == id)
 
-    if status:
-        query = query.where(WorkflowRun.status == status)
+# Seed default workflows on module load
+_seed_workflows()
 
-    count_query = select(func.count()).select_from(query.subquery())
-    total_result = await db.execute(count_query)
-    total = total_result.scalar_one()
-
-    query = (
-        query.order_by(WorkflowRun.created_at.desc()).offset(skip).limit(limit)
-    )
-    result = await db.execute(query)
-    items = result.scalars().all()
-
-    return WorkflowRunsListResponse(
-        items=list(items),
-        total=total,
-        skip=skip,
-        limit=limit,
-    )
+def _seed_workflows():
+    """Create default workflow templates."""
+    defaults = [
+        {
+            "id": "wf-code-review",
+            "name": "代码审查流水线",
+            "slug": "code-review-pipeline",
+            "description": "自动代码审查：获取代码 -> Claude审查 -> Codex重构 -> 产出报告",
+            "definition": {
+                "nodes": [
+                    {"id": "start", "type": "start", "data": {}},
+                    {"id": "fetch", "type": "claude", "data": {"config": {"agent": {"taskDescription": "获取并理解代码文件内容", "timeout": 60}}}},
+                    {"id": "review", "type": "claude", "data": {"config": {"agent": {"taskDescription": "审查代码质量、安全性和风格问题:\n{{inputs.code}}", "timeout": 120}}}},
+                    {"id": "refactor", "type": "codex", "data": {"config": {"agent": {"taskDescription": "根据审查意见重构代码", "timeout": 120}}}},
+                    {"id": "end", "type": "end", "data": {}},
+                ],
+                "edges": [
+                    {"id": "e1", "source": "start", "target": "fetch"},
+                    {"id": "e2", "source": "fetch", "target": "review"},
+                    {"id": "e3", "source": "review", "target": "refactor"},
+                    {"id": "e4", "source": "refactor", "target": "end"},
+                ],
+            },
+        },
+        {
+            "id": "wf-research",
+            "name": "多Agent研究分析",
+            "slug": "multi-agent-research",
+            "description": "多个Agent并行研究同一主题，最后综合汇总",
+            "definition": {
+                "nodes": [
+                    {"id": "start", "type": "start", "data": {}},
+                    {"id": "parallel", "type": "parallel", "data": {}},
+                    {"id": "claude_research", "type": "claude", "data": {"config": {"agent": {"taskDescription": "从理论角度研究:\n{{inputs.topic}}", "timeout": 120}}}},
+                    {"id": "codex_research", "type": "codex", "data": {"config": {"agent": {"taskDescription": "从实现角度研究:\n{{inputs.topic}}", "timeout": 120}}}},
+                    {"id": "openclaw_research", "type": "openclaw", "data": {"config": {"agent": {"taskDescription": "搜索网络资源:\n{{inputs.topic}}", "timeout": 120}}}},
+                    {"id": "merge", "type": "merge", "data": {}},
+                    {"id": "end", "type": "end", "data": {}},
+                ],
+                "edges": [
+                    {"id": "e1", "source": "start", "target": "parallel"},
+                    {"id": "e2", "source": "parallel", "target": "claude_research"},
+                    {"id": "e3", "source": "parallel", "target": "codex_research"},
+                    {"id": "e4", "source": "parallel", "target": "openclaw_research"},
+                    {"id": "e5", "source": "claude_research", "target": "merge"},
+                    {"id": "e6", "source": "codex_research", "target": "merge"},
+                    {"id": "e7", "source": "openclaw_research", "target": "merge"},
+                    {"id": "e8", "source": "merge", "target": "end"},
+                ],
+            },
+        },
+        {
+            "id": "wf-data-pipeline",
+            "name": "数据处理管道",
+            "slug": "data-processing-pipeline",
+            "description": "数据抓取 -> 清洗 -> 分析 -> 报告",
+            "definition": {
+                "nodes": [
+                    {"id": "start", "type": "start", "data": {}},
+                    {"id": "scrape", "type": "openclaw", "data": {"config": {"agent": {"taskDescription": "抓取数据源: {{inputs.url}}", "timeout": 120}}}},
+                    {"id": "clean", "type": "claude", "data": {"config": {"agent": {"taskDescription": "清洗和规范化数据", "timeout": 90}}}},
+                    {"id": "analyze", "type": "codex", "data": {"config": {"agent": {"taskDescription": "数据分析并生成可视化脚本", "timeout": 120}}}},
+                    {"id": "end", "type": "end", "data": {}},
+                ],
+                "edges": [
+                    {"id": "e1", "source": "start", "target": "scrape"},
+                    {"id": "e2", "source": "scrape", "target": "clean"},
+                    {"id": "e3", "source": "clean", "target": "analyze"},
+                    {"id": "e4", "source": "analyze", "target": "end"},
+                ],
+            },
+        },
+    ]
+    for wf in defaults:
+        _workflows[wf["id"]] = wf

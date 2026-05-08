@@ -1,221 +1,164 @@
-"""
-Codex adapter for OpenAI's Codex API.
+"""Codex adapter - connects to OpenAI API for code generation and refactoring."""
 
-Specialized in code-focused operations including code generation,
-refactoring, review, and test generation.
-"""
 from __future__ import annotations
 
 import asyncio
-import random
-import time
+import json
+import os
+from typing import Any
+
+import httpx
 
 from app.adapters.base import BaseAdapter
-from app.utils.helpers import generate_uuid, now_iso
+
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 
 class CodexAdapter(BaseAdapter):
-    """Adapter for OpenAI Codex - code expert agent.
+    """Production adapter for OpenAI Codex / GPT-4o via HTTP API.
 
-    Optimized for software engineering tasks including code completion,
-    refactoring, review, and automated test generation.
+    Requires ``OPENAI_API_KEY`` environment variable or ``api_key``
+    in the agent configuration.
     """
 
-    async def execute(self, task_description: str, variables: dict) -> dict:
-        """Execute a code-focused task on Codex.
+    async def execute(self, task_description: str, variables: dict | None = None) -> dict[str, Any]:
+        """Send coding task to OpenAI and return result."""
+        api_key = self._api_key()
+        if not api_key:
+            return {
+                "status": "error",
+                "output": (
+                    "❌ OpenAI API key not configured.\n\n"
+                    "Set one of:\n"
+                    "  • Environment variable: OPENAI_API_KEY=sk-...\n"
+                    "  • Agent config API key field\n\n"
+                    "Get your key at: https://platform.openai.com/api-keys"
+                ),
+                "tokens_input": 0,
+                "tokens_output": 0,
+                "duration_ms": 0,
+            }
 
-        Generates code snippets, refactoring suggestions, or test cases
-        based on the task description and provided variables.
+        code_context = (variables or {}).get("code", "")
+        user_message = self._build_prompt(task_description, code_context)
 
-        Args:
-            task_description: Natural language task description.
-            variables: Context variables including code context.
-
-        Returns:
-            Execution result with code output and metadata.
-        """
-        start = time.time()
-
-        # Simulate processing (0.5-2.5 seconds for code tasks)
-        await asyncio.sleep(random.uniform(0.5, 2.5))
-        duration = int((time.time() - start) * 1000)
-
-        # Generate code-focused responses
-        task_lower = task_description.lower()
-        if "refactor" in task_lower or "refactoring" in task_lower:
-            output = (
-                "## Refactoring Suggestions\n\n"
-                "```python\n"
-                "# Before\ndef process(data):\n"
-                "    result = []\n"
-                "    for item in data:\n"
-                "        if item.active:\n"
-                "            result.append(transform(item))\n"
-                "    return result\n\n"
-                "# After\nfrom functools import partial\n\n"
-                "def process(data):\n"
-                "    return [transform(item) for item in data if item.active]\n"
-                "```\n\n"
-                "- Extracted list comprehension for clarity\n"
-                "- Reduced cyclomatic complexity from 4 to 1\n"
-                "- Performance improvement: ~15% faster for large datasets"
-            )
-        elif "test" in task_lower or "tests" in task_lower:
-            output = (
-                "## Generated Tests\n\n"
-                "```python\n"
-                "import pytest\n"
-                "from unittest.mock import Mock, patch\n\n"
-                "class TestUserService:\n"
-                "    @pytest.mark.asyncio\n"
-                "    async def test_create_user_success(self):\n"
-                "        service = UserService()\n"
-                "        user = await service.create({'name': 'Alice', 'email': 'alice@example.com'})\n"
-                "        assert user.id is not None\n"
-                "        assert user.name == 'Alice'\n\n"
-                "    @pytest.mark.asyncio\n"
-                "    async def test_create_user_duplicate_email(self):\n"
-                "        service = UserService()\n"
-                "        with pytest.raises(DuplicateError):\n"
-                "            await service.create({'name': 'Bob', 'email': 'alice@example.com'})\n"
-                "```"
-            )
-        elif "generate" in task_lower or "code" in task_lower:
-            output = (
-                "## Generated Code\n\n"
-                "```python\n"
-                "from fastapi import APIRouter, Depends, HTTPException\n"
-                "from sqlalchemy.ext.asyncio import AsyncSession\n\n"
-                "router = APIRouter(prefix='/api/v1/users')\n\n"
-                "@router.get('/{user_id}')\n"
-                "async def get_user(\n"
-                "    user_id: UUID,\n"
-                "    db: AsyncSession = Depends(get_db)\n"
-                "): -> UserResponse:\n"
-                "    user = await db.get(User, user_id)\n"
-                "    if not user:\n"
-                "        raise HTTPException(status_code=404, detail='User not found')\n"
-                "    return UserResponse.model_validate(user)\n"
-                "```\n\n"
-                "- Includes proper type hints and validation\n"
-                "- Handles error cases with appropriate HTTP status codes\n"
-                "- Uses async/await for non-blocking database access"
-            )
-        else:
-            output = (
-                "## Code Analysis\n\n"
-                "```python\n"
-                "# Suggested implementation\n"
-                "async def handle_request(request: Request) -> Response:\n"
-                "    try:\n"
-                "        validated = await validate(request)\n"
-                "        result = await process(validated)\n"
-                "        return success_response(result)\n"
-                "    except ValidationError as e:\n"
-                "        return error_response(400, str(e))\n"
-                "    except Exception as e:\n"
-                "        logger.exception('Unhandled error')\n"
-                "        return error_response(500, 'Internal error')\n"
-                "```\n\n"
-                "Code quality score: 92/100\n"
-                "- Proper error handling with specific exceptions\n"
-                "- Structured logging for debugging\n"
-                "- Async pattern for I/O operations"
-            )
-
-        return {
-            "output": output,
-            "tokens_input": len(task_description) // 4 + len(str(variables)) // 8,
-            "tokens_output": len(output) // 4,
-            "duration_ms": duration,
-            "status": "completed",
-            "run_id": generate_uuid(),
-            "completed_at": now_iso(),
+        request_body = {
+            "model": self.config.get("model", "gpt-4o"),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Codex, an expert programming assistant. "
+                        "Provide clean, well-commented code with explanations. "
+                        "Always wrap code blocks in markdown triple backticks."
+                    ),
+                },
+                {"role": "user", "content": user_message},
+            ],
+            "max_tokens": self.config.get("max_tokens", 4096),
+            "temperature": self.config.get("temperature", 0.2),
         }
 
-    async def health_check(self) -> dict:
-        """Check Codex agent health status.
+        return await self._call_openai(request_body)
 
-        Returns:
-            Health status dict with agent info.
-        """
-        return {
-            "status": "online",
-            "agent": "codex",
-            "version": "2024-05",
-            "checked_at": now_iso(),
-        }
+    async def health_check(self) -> dict[str, Any]:
+        """Check OpenAI API connectivity."""
+        api_key = self._api_key()
+        if not api_key:
+            return {"status": "offline", "reason": "API key not configured"}
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                if response.status_code == 200:
+                    return {
+                        "status": "online",
+                        "api": "openai",
+                        "latency_ms": int(response.elapsed.total_seconds() * 1000),
+                    }
+                return {"status": "error", "code": response.status_code}
+        except Exception as exc:
+            return {"status": "offline", "reason": str(exc)}
 
     async def list_tools(self) -> list[dict]:
-        """List available MCP tools exposed by Codex.
-
-        Returns:
-            List of code-focused tool definitions.
-        """
         return [
             {
-                "name": "code_generation",
-                "description": "Generate code from a natural language description",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "language": {"type": "string", "description": "Target programming language"},
-                        "description": {"type": "string", "description": "Code requirements"},
-                        "context": {"type": "string", "description": "Existing code context (optional)"},
-                    },
-                    "required": ["language", "description"],
-                },
+                "name": "generate_code",
+                "description": "Generate code from description",
+                "parameters": {"language": "string", "description": "string"},
             },
             {
-                "name": "code_refactor",
-                "description": "Refactor code for improved quality and performance",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "Code to refactor"},
-                        "goals": {"type": "array", "items": {"type": "string"}, "description": "Refactoring goals"},
-                    },
-                    "required": ["code"],
-                },
+                "name": "refactor_code",
+                "description": "Refactor code for performance/readability",
+                "parameters": {"code": "string", "goals": "string[]"},
             },
             {
-                "name": "code_explain",
-                "description": "Explain what a piece of code does",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "Code to explain"},
-                    },
-                    "required": ["code"],
-                },
+                "name": "explain_code",
+                "description": "Explain what code does step by step",
+                "parameters": {"code": "string"},
             },
             {
-                "name": "bug_fix",
+                "name": "fix_bugs",
                 "description": "Identify and fix bugs in code",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "Code with potential bugs"},
-                        "error": {"type": "string", "description": "Error message or description"},
-                    },
-                    "required": ["code"],
-                },
+                "parameters": {"code": "string", "error_message": "string"},
             },
         ]
 
     async def call_tool(self, tool_name: str, arguments: dict) -> dict:
-        """Call a specific MCP tool on Codex.
+        task = f"Execute tool '{tool_name}' with: {json.dumps(arguments)}"
+        return await self.execute(task)
 
-        Args:
-            tool_name: Name of the tool to invoke.
-            arguments: Tool arguments.
+    # ─── helpers ─────────────────────────────────────────────
 
-        Returns:
-            Tool execution result.
-        """
-        return {
-            "tool": tool_name,
-            "result": f"Codex executed {tool_name} with {arguments}",
-            "agent": "codex",
-            "timestamp": now_iso(),
-        }
+    def _api_key(self) -> str | None:
+        return self.config.get("api_key") or os.environ.get("OPENAI_API_KEY")
+
+    def _build_prompt(self, task: str, code: str) -> str:
+        if code:
+            return f"Task: {task}\n\n```\n{code}\n```"
+        return task
+
+    async def _call_openai(self, body: dict) -> dict[str, Any]:
+        api_key = self._api_key()
+        start = asyncio.get_event_loop().time()
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    OPENAI_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            duration_ms = int((asyncio.get_event_loop().time() - start) * 1000)
+            choice = data["choices"][0]
+
+            return {
+                "status": "completed",
+                "output": choice["message"]["content"],
+                "tokens_input": data.get("usage", {}).get("prompt_tokens", 0),
+                "tokens_output": data.get("usage", {}).get("completion_tokens", 0),
+                "duration_ms": duration_ms,
+                "model": data.get("model"),
+                "finish_reason": choice.get("finish_reason"),
+            }
+        except httpx.HTTPStatusError as exc:
+            return {
+                "status": "error",
+                "output": f"OpenAI API error: {exc.response.text[:300]}",
+                "duration_ms": int((asyncio.get_event_loop().time() - start) * 1000),
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "output": f"Error: {type(exc).__name__}: {exc}",
+                "duration_ms": int((asyncio.get_event_loop().time() - start) * 1000),
+            }
