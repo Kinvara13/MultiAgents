@@ -1,0 +1,25 @@
+# Dependencies
+frontend/node_modules/
+backend/__pycache__/
+backend/**/*.pyc
+backend/.env
+
+# Build outputs
+frontend/dist/
+frontend/dist-backup/
+
+# Media assets (generated, can be rebuilt)
+frontend/public/*.mp4
+frontend/public/*.png
+
+# Python
+backend/.venv/
+backend/venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
